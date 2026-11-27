@@ -26,6 +26,8 @@ info:
     - Chaque reponse d'erreur suit le schema `Error`.
     - Chaque action sensible (login, echec, MFA, logout, activation MFA) produit un
       evenement d'audit (F15) ; aucun secret ni mot de passe n'apparait dans les logs.
+  license:
+    name: MIT
 servers:
   - url: http://localhost:8001
     description: Developpement (auth-service seul)
@@ -42,6 +44,7 @@ tags:
 paths:
   /auth/login:
     post:
+      security: []
       tags: [Session]
       summary: Connexion par e-mail et mot de passe (F01)
       operationId: login
@@ -147,9 +150,9 @@ paths:
                 $ref: '#/components/schemas/Error'
               examples:
                 invalidCode:
-                  value: { code: INVALID_MFA_CODE, message: Code de verification incorrect. }
+                  value: { code: INVALID_MFA_CODE, message: "Code de verification incorrect." }
                 sessionExpired:
-                  value: { code: MFA_SESSION_EXPIRED, message: Etape de connexion expiree, recommencez. }
+                  value: { code: MFA_SESSION_EXPIRED, message: "Etape de connexion expiree, recommencez." }
         '403':
           $ref: '#/components/responses/AccountBlocked'
         '422':
@@ -188,7 +191,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example: { code: MFA_ALREADY_ACTIVE, message: Le MFA est deja active. }
+              example: { code: MFA_ALREADY_ACTIVE, message: "Le MFA est deja active." }
         '429':
           $ref: '#/components/responses/RateLimited'
 
@@ -231,14 +234,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example: { code: INVALID_MFA_CODE, message: Code de verification incorrect. }
+              example: { code: INVALID_MFA_CODE, message: "Code de verification incorrect." }
         '409':
           description: MFA deja actif, ou aucun `setup` en attente (`MFA_NOT_SETUP`)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example: { code: MFA_NOT_SETUP, message: Lancez d'abord la configuration du MFA. }
+              example: { code: MFA_NOT_SETUP, message: "Lancez d'abord la configuration du MFA." }
         '422':
           $ref: '#/components/responses/ValidationError'
         '429':
@@ -273,7 +276,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example: { code: MFA_REQUIRED_FOR_ROLE, message: Le MFA est obligatoire pour votre role. }
+              example: { code: MFA_REQUIRED_FOR_ROLE, message: "Le MFA est obligatoire pour votre role." }
         '422':
           $ref: '#/components/responses/ValidationError'
         '429':
@@ -305,12 +308,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-              example: { code: TOKEN_EXPIRED, message: Session expiree, reconnectez-vous. }
+              example: { code: TOKEN_EXPIRED, message: "Session expiree, reconnectez-vous." }
         '429':
           $ref: '#/components/responses/RateLimited'
 
   /auth/logout:
     post:
+      security:
+        - accessCookie: []
       tags: [Session]
       summary: Deconnexion (F03)
       operationId: logout
@@ -325,6 +330,8 @@ paths:
           headers:
             Set-Cookie:
               $ref: '#/components/headers/SetCookie'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
 
   /auth/me:
     get:
@@ -391,7 +398,7 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-          example: { code: INVALID_CREDENTIALS, message: Identifiants invalides. }
+          example: { code: INVALID_CREDENTIALS, message: "Identifiants invalides." }
     AccountBlocked:
       description: Compte verrouille temporairement (5 echecs) ou desactive
       content:
@@ -402,17 +409,17 @@ components:
             locked:
               value:
                 code: ACCOUNT_LOCKED
-                message: Compte temporairement verrouille. Reessayez plus tard.
+                message: "Compte temporairement verrouille. Reessayez plus tard."
                 retry_after: 900
             disabled:
-              value: { code: ACCOUNT_DISABLED, message: Compte desactive. Contactez l'administration. }
+              value: { code: ACCOUNT_DISABLED, message: "Compte desactive. Contactez l'administration." }
     Unauthenticated:
       description: Non authentifie (jeton absent, expire ou invalide)
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-          example: { code: UNAUTHENTICATED, message: Authentification requise. }
+          example: { code: UNAUTHENTICATED, message: "Authentification requise." }
     ValidationError:
       description: Corps de requete invalide (champ manquant, format incorrect, champ inconnu)
       content:
@@ -421,9 +428,9 @@ components:
             $ref: '#/components/schemas/Error'
           example:
             code: VALIDATION_ERROR
-            message: Requete invalide.
+            message: "Requete invalide."
             details:
-              - { field: email, message: Format d'e-mail invalide. }
+              - { field: email, message: "Format d'e-mail invalide." }
     RateLimited:
       description: Trop de requetes
       headers:
@@ -433,7 +440,7 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
-          example: { code: RATE_LIMITED, message: Trop de tentatives, reessayez plus tard., retry_after: 300 }
+          example: { code: RATE_LIMITED, message: "Trop de tentatives, reessayez plus tard.", retry_after: 300 }
 
   schemas:
     Role:
