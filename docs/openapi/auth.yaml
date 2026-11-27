@@ -1,0 +1,616 @@
+openapi: 3.0.3
+info:
+  title: Auth Service - Gestion simplifiee de notes etudiantes
+  version: 1.0.0
+  description: |
+    Contrat d'API de l'authentification (F01, F03) pour le client web (responsive).
+
+    **Principes**
+    - Les jetons ne sont jamais lus par le JavaScript : ils sont poses par le serveur
+      dans des cookies `HttpOnly; Secure; SameSite=Strict`. Le frontend n'envoie
+      donc aucun en-tete `Authorization` et active `withCredentials: true`.
+    - Cookies poses :
+      | Cookie | Duree | Path | Role |
+      |---|---|---|---|
+      | `access_token` | 15 min | `/` | JWT d'acces |
+      | `refresh_token` | 7 jours, rotation a chaque usage | `/auth` | renouvellement de session |
+      | `mfa_session` | 5 min | `/auth/mfa` | etape intermediaire du login (code MFA attendu) ou configuration MFA obligatoire |
+    - Protection CSRF : en plus de `SameSite=Strict`, toute requete POST doit porter
+      l'en-tete `X-Requested-With: XMLHttpRequest` et le `Content-Type: application/json`.
+      Sinon : 403 `CSRF_REJECTED`.
+    - Politique MFA : obligatoire pour `ENSEIGNANT`, `RESPONSABLE_FILIERE`, `SCOLARITE`
+      et `ADMIN` ; facultative pour `ETUDIANT` (activation volontaire depuis son profil).
+    - Anti-enumeration : un e-mail inconnu et un mauvais mot de passe renvoient la meme
+      reponse (401 `INVALID_CREDENTIALS`). Les echecs sont comptes par e-mail, qu'il
+      existe ou non ; apres 5 echecs, la reponse devient 403 `ACCOUNT_LOCKED` dans les deux cas.
+    - Chaque reponse d'erreur suit le schema `Error`.
+    - Chaque action sensible (login, echec, MFA, logout, activation MFA) produit un
+      evenement d'audit (F15) ; aucun secret ni mot de passe n'apparait dans les logs.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8001
+    description: Developpement (auth-service seul)
+  - url: https://api-staging.votre-domaine.cm
+    description: Staging (via Traefik)
+  - url: https://api.votre-domaine.cm
+    description: Production (via Traefik)
+tags:
+  - name: Session
+    description: Connexion, renouvellement, deconnexion, utilisateur courant
+  - name: MFA
+    description: Authentification a deux facteurs (TOTP)
+
+paths:
+  /auth/login:
+    post:
+      security: []
+      tags: [Session]
+      summary: Connexion par e-mail et mot de passe (F01)
+      operationId: login
+      description: |
+        Verifie les identifiants. Le champ `status` de la reponse indique la suite :
+        - `authenticated` : session ouverte, cookies `access_token` et `refresh_token` poses.
+        - `mfa_required` : mot de passe correct, MFA actif ; cookie `mfa_session` pose.
+          Appeler `POST /auth/mfa/verify`.
+        - `mfa_enrollment_required` : role a MFA obligatoire mais MFA pas encore configure ;
+          cookie `mfa_session` pose. Appeler `POST /auth/mfa/setup` puis `/auth/mfa/activate`.
+        Limitation : 5 tentatives / 5 min par IP au niveau du gateway (429), et
+        verrouillage temporaire du compte apres 5 echecs consecutifs.
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: enseignant@ecole.cm
+              password: MotDePasseTresSolide!42
+      responses:
+        '200':
+          description: Identifiants valides (voir `status`)
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              examples:
+                authenticated:
+                  summary: Etudiant sans MFA
+                  value:
+                    status: authenticated
+                    user:
+                      id: 3f0c2b6e-8a4e-4a52-9c1f-0f6a6a2b1d10
+                      email: etudiant@ecole.cm
+                      role: ETUDIANT
+                      mfa_active: false
+                      mfa_required: false
+                mfa_required:
+                  summary: Code MFA attendu
+                  value:
+                    status: mfa_required
+                    mfa_expires_in: 300
+                mfa_enrollment_required:
+                  summary: Configuration MFA obligatoire
+                  value:
+                    status: mfa_enrollment_required
+                    mfa_expires_in: 300
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '403':
+          $ref: '#/components/responses/AccountBlocked'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/mfa/verify:
+    post:
+      tags: [MFA]
+      summary: Validation du code MFA lors de la connexion (F01)
+      operationId: verifyMfa
+      description: |
+        Necessite le cookie `mfa_session` (etape `mfa_required`). Accepte soit un code TOTP
+        a 6 chiffres, soit un code de secours (usage unique). Succes : pose `access_token`
+        et `refresh_token`, supprime `mfa_session`.
+      security:
+        - mfaSessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MfaVerifyRequest'
+            examples:
+              totp:
+                value: { code: '123456' }
+              recovery:
+                value: { recovery_code: 'A1B2-C3D4-E5F6' }
+      responses:
+        '200':
+          description: Session ouverte
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticatedResponse'
+        '401':
+          description: Code invalide, ou etape de connexion expiree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidCode:
+                  value: { code: INVALID_MFA_CODE, message: "Code de verification incorrect." }
+                sessionExpired:
+                  value: { code: MFA_SESSION_EXPIRED, message: "Etape de connexion expiree, recommencez." }
+        '403':
+          $ref: '#/components/responses/AccountBlocked'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/mfa/setup:
+    post:
+      tags: [MFA]
+      summary: Demarrer la configuration du MFA
+      operationId: setupMfa
+      description: |
+        Genere un nouveau secret TOTP (stocke chiffre en AES-256, non encore actif) et renvoie
+        l'URI `otpauth://` que le frontend transforme en QR code. Utilisable :
+        - avec `mfa_session` (role a MFA obligatoire, etape `mfa_enrollment_required`) ;
+        - avec `access_token` (etudiant qui active le MFA volontairement).
+        Un nouvel appel remplace le secret en attente. 409 si le MFA est deja actif.
+      security:
+        - mfaSessionCookie: []
+        - accessCookie: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '200':
+          description: Secret genere
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MfaSetupResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '409':
+          description: MFA deja actif
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { code: MFA_ALREADY_ACTIVE, message: "Le MFA est deja active." }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/mfa/activate:
+    post:
+      tags: [MFA]
+      summary: Confirmer la configuration du MFA avec un premier code
+      operationId: activateMfa
+      description: |
+        Valide un code TOTP genere avec le secret du `setup`, active le MFA et renvoie 8 codes
+        de secours (affiches une seule fois, stockes hashes cote serveur).
+        - Appele avec `mfa_session` : la connexion se termine (cookies de session poses,
+          `status = authenticated`).
+        - Appele avec `access_token` : la session existante continue.
+      security:
+        - mfaSessionCookie: []
+        - accessCookie: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MfaActivateRequest'
+            example: { code: '123456' }
+      responses:
+        '200':
+          description: MFA active
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MfaActivateResponse'
+        '401':
+          description: Code invalide, session absente ou expiree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { code: INVALID_MFA_CODE, message: "Code de verification incorrect." }
+        '409':
+          description: MFA deja actif, ou aucun `setup` en attente (`MFA_NOT_SETUP`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { code: MFA_NOT_SETUP, message: "Lancez d'abord la configuration du MFA." }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/mfa/disable:
+    post:
+      tags: [MFA]
+      summary: Desactiver le MFA (role ETUDIANT uniquement)
+      operationId: disableMfa
+      description: |
+        Reserve aux utilisateurs dont le role n'impose pas le MFA (`ETUDIANT`). Exige le mot de
+        passe et un code TOTP valide. Les autres roles recoivent 403 `MFA_REQUIRED_FOR_ROLE`.
+      security:
+        - accessCookie: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MfaDisableRequest'
+      responses:
+        '204':
+          description: MFA desactive
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: Role a MFA obligatoire, ou CSRF
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { code: MFA_REQUIRED_FOR_ROLE, message: "Le MFA est obligatoire pour votre role." }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/refresh:
+    post:
+      tags: [Session]
+      summary: Renouveler la session (F03)
+      operationId: refreshSession
+      description: |
+        Utilise le cookie `refresh_token`. Succes : nouveaux cookies `access_token` et
+        `refresh_token` (rotation : l'ancien refresh token devient invalide). Si un refresh
+        token deja utilise est presente, toute la session est revoquee (suspicion de vol) et
+        la reponse est 401 `TOKEN_EXPIRED`. Pas de corps de requete.
+      security:
+        - refreshCookie: []
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '204':
+          description: Session renouvelee
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+        '401':
+          description: Refresh token absent, expire, revoque ou rejoue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: { code: TOKEN_EXPIRED, message: "Session expiree, reconnectez-vous." }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/logout:
+    post:
+      security: []
+      tags: [Session]
+      summary: Deconnexion (F03)
+      operationId: logout
+      description: |
+        Revoque la session correspondant au cookie `refresh_token` (s'il est present) et efface
+        les cookies. Route publique et idempotente : repond toujours 204, meme si la session
+        est deja expiree ou absente.
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      responses:
+        '204':
+          description: Deconnecte
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+
+  /auth/me:
+    get:
+      tags: [Session]
+      summary: Utilisateur courant
+      operationId: getCurrentUser
+      description: |
+        Sert aux gardes de routes du frontend (role, MFA). Renvoie 401 si le jeton d'acces est
+        absent ou expire ; le frontend tente alors `POST /auth/refresh` une fois, puis
+        redirige vers la connexion.
+      security:
+        - accessCookie: []
+      responses:
+        '200':
+          description: Utilisateur authentifie
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+components:
+  securitySchemes:
+    accessCookie:
+      type: apiKey
+      in: cookie
+      name: access_token
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+    mfaSessionCookie:
+      type: apiKey
+      in: cookie
+      name: mfa_session
+
+  parameters:
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      description: Doit valoir `XMLHttpRequest` (protection CSRF).
+      schema:
+        type: string
+        enum: [XMLHttpRequest]
+
+  headers:
+    SetCookie:
+      description: Cookies de session (voir la description generale du contrat).
+      schema:
+        type: string
+        example: access_token=eyJ...; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=900
+    RetryAfter:
+      description: Secondes a attendre avant de reessayer.
+      schema:
+        type: integer
+        example: 300
+
+  responses:
+    InvalidCredentials:
+      description: E-mail ou mot de passe incorrect (message volontairement identique)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { code: INVALID_CREDENTIALS, message: "Identifiants invalides." }
+    AccountBlocked:
+      description: Compte verrouille temporairement (5 echecs) ou desactive
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            locked:
+              value:
+                code: ACCOUNT_LOCKED
+                message: "Compte temporairement verrouille. Reessayez plus tard."
+                retry_after: 900
+            disabled:
+              value: { code: ACCOUNT_DISABLED, message: "Compte desactive. Contactez l'administration." }
+    Unauthenticated:
+      description: Non authentifie (jeton absent, expire ou invalide)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { code: UNAUTHENTICATED, message: "Authentification requise." }
+    ValidationError:
+      description: Corps de requete invalide (champ manquant, format incorrect, champ inconnu)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: VALIDATION_ERROR
+            message: "Requete invalide."
+            details:
+              - { field: email, message: "Format d'e-mail invalide." }
+    RateLimited:
+      description: Trop de requetes
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { code: RATE_LIMITED, message: "Trop de tentatives, reessayez plus tard.", retry_after: 300 }
+
+  schemas:
+    Role:
+      type: string
+      enum: [ETUDIANT, ENSEIGNANT, RESPONSABLE_FILIERE, SCOLARITE, ADMIN]
+
+    User:
+      type: object
+      required: [id, email, role, mfa_active, mfa_required]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/Role'
+        mfa_active:
+          type: boolean
+          description: Le MFA est configure et actif pour cet utilisateur.
+        mfa_required:
+          type: boolean
+          description: Le role impose le MFA (false uniquement pour ETUDIANT).
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: La politique de complexite s'applique a la creation/changement de mot de passe, pas au login.
+
+    LoginResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [authenticated, mfa_required, mfa_enrollment_required]
+        user:
+          allOf:
+            - $ref: '#/components/schemas/User'
+          description: Present uniquement si `status = authenticated`.
+        mfa_expires_in:
+          type: integer
+          description: Secondes de validite du cookie `mfa_session` (si MFA requis ou a configurer).
+          example: 300
+
+    AuthenticatedResponse:
+      type: object
+      required: [status, user]
+      properties:
+        status:
+          type: string
+          enum: [authenticated]
+        user:
+          $ref: '#/components/schemas/User'
+
+    MfaVerifyRequest:
+      type: object
+      additionalProperties: false
+      description: Fournir `code` OU `recovery_code`.
+      properties:
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+        recovery_code:
+          type: string
+          pattern: '^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$'
+      oneOf:
+        - required: [code]
+        - required: [recovery_code]
+
+    MfaSetupResponse:
+      type: object
+      required: [otpauth_uri, secret]
+      properties:
+        otpauth_uri:
+          type: string
+          description: URI a encoder en QR code cote client.
+          example: otpauth://totp/GestionNotes:enseignant%40ecole.cm?secret=JBSWY3DPEHPK3PXP&issuer=GestionNotes
+        secret:
+          type: string
+          description: Secret en base32, affiche pour saisie manuelle. Ne jamais le journaliser ni le stocker cote client.
+          example: JBSWY3DPEHPK3PXP
+
+    MfaActivateRequest:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+
+    MfaActivateResponse:
+      type: object
+      required: [status, user, recovery_codes]
+      properties:
+        status:
+          type: string
+          enum: [authenticated]
+        user:
+          $ref: '#/components/schemas/User'
+        recovery_codes:
+          type: array
+          description: 8 codes de secours a usage unique, affiches une seule fois.
+          minItems: 8
+          maxItems: 8
+          items:
+            type: string
+            example: A1B2-C3D4-E5F6
+
+    MfaDisableRequest:
+      type: object
+      additionalProperties: false
+      required: [password, code]
+      properties:
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+        code:
+          type: string
+          pattern: '^[0-9]{6}$'
+
+    ErrorCode:
+      type: string
+      enum:
+        - INVALID_CREDENTIALS
+        - ACCOUNT_LOCKED
+        - ACCOUNT_DISABLED
+        - INVALID_MFA_CODE
+        - MFA_SESSION_EXPIRED
+        - MFA_ALREADY_ACTIVE
+        - MFA_NOT_SETUP
+        - MFA_REQUIRED_FOR_ROLE
+        - TOKEN_EXPIRED
+        - UNAUTHENTICATED
+        - FORBIDDEN
+        - CSRF_REJECTED
+        - RATE_LIMITED
+        - VALIDATION_ERROR
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Message affichable a l'utilisateur, sans information sensible.
+        retry_after:
+          type: integer
+          description: Secondes avant nouvelle tentative (verrouillage, limitation).
+        details:
+          type: array
+          description: Erreurs de validation par champ (422).
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
