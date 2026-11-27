@@ -314,14 +314,14 @@ paths:
 
   /auth/logout:
     post:
-      security:
-        - accessCookie: []
+      security: []
       tags: [Session]
       summary: Deconnexion (F03)
       operationId: logout
       description: |
-        Revoque la session cote serveur et efface les cookies. Idempotent : repond 204 meme
-        si la session etait deja expiree.
+        Revoque la session correspondant au cookie `refresh_token` (s'il est present) et efface
+        les cookies. Route publique et idempotente : repond toujours 204, meme si la session
+        est deja expiree ou absente.
       parameters:
         - $ref: '#/components/parameters/XRequestedWith'
       responses:
@@ -330,8 +330,6 @@ paths:
           headers:
             Set-Cookie:
               $ref: '#/components/headers/SetCookie'
-        '401':
-          $ref: '#/components/responses/Unauthenticated'
 
   /auth/me:
     get:
